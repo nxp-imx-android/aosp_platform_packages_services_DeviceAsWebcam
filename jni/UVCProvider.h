@@ -194,6 +194,7 @@ class UVCProvider : public std::enable_shared_from_this<UVCProvider> {
     std::thread mUVCListenerThread;
     volatile bool mListenToUVCFds = true;
     EpollW mEpollW;
+    static std::string mdevNodeOutPut;
 };
 
 }  // namespace webcam
