@@ -49,6 +49,7 @@ constexpr uint32_t FRAME_INTERVAL_NUM = 10'000'000;
 
 namespace android {
 namespace webcam {
+std::string UVCProvider::mdevNodeOutPut = "";
 
 Status EpollW::init() {
     int fd = epoll_create1(EPOLL_CLOEXEC);
@@ -342,6 +343,11 @@ void UVCProvider::UVCDevice::closeUVCFd() {
 
 std::string UVCProvider::getVideoNode(const std::unordered_set<std::string>& ignoredNodes) {
     std::string devNode;
+
+    if (mdevNodeOutPut.length() != 0) {
+        ALOGV("%s has scanned the V4L2 OUTPUT device before, return the device:%s", __FUNCTION__, mdevNodeOutPut.c_str());
+        return mdevNodeOutPut;
+    }
     ALOGV("%s start scanning for existing V4L2 OUTPUT devices", __FUNCTION__);
     glob_t globRes;
     glob(kDeviceGlobPattern, /*flags*/ 0, /*error_callback*/ nullptr, &globRes);
@@ -354,6 +360,7 @@ std::string UVCProvider::getVideoNode(const std::unordered_set<std::string>& ign
 
         if (isVideoOutputDevice(node)) {
             devNode = globRes.gl_pathv[i];
+            mdevNodeOutPut = devNode;
             break;
         }
     }
@@ -752,6 +759,7 @@ UVCProvider::~UVCProvider() {
         }
     }
     mUVCDevice = nullptr;
+    mdevNodeOutPut.clear();
 }
 
 Status UVCProvider::init() {
@@ -950,6 +958,7 @@ void UVCProvider::stopService() {
     DeviceAsWebcamServiceManager::kInstance->stopService();
     mUVCDevice = nullptr;
     mListenToUVCFds = false;
+    mdevNodeOutPut.clear();
 }
 
 }  // namespace webcam
