@@ -16,14 +16,24 @@
 
 package com.android.DeviceAsWebcam;
 
+import static android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK;
+
+import android.accessibilityservice.AccessibilityServiceInfo;
 import android.animation.ObjectAnimator;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Insets;
+import android.graphics.Paint;
 import android.graphics.SurfaceTexture;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.ShapeDrawable;
+import android.graphics.drawable.shapes.OvalShape;
 import android.hardware.camera2.CameraCharacteristics;
 import android.os.Bundle;
 import android.os.ConditionVariable;
@@ -31,8 +41,11 @@ import android.os.IBinder;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
+import android.view.accessibility.AccessibilityManager;
+import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
@@ -47,30 +60,48 @@ import androidx.cardview.widget.CardView;
 
 import com.android.DeviceAsWebcam.view.ZoomController;
 
+import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 public class DeviceAsWebcamPreview extends Activity {
     private static final String TAG = DeviceAsWebcamPreview.class.getSimpleName();
     private static final boolean VERBOSE = Log.isLoggable(TAG, Log.VERBOSE);
     private static final int ROTATION_ANIMATION_DURATION_MS = 300;
 
-    private static final int MAX_PREVIEW_WIDTH = 1920;
-    private static final int MAX_PREVIEW_HEIGHT = 1080;
-
     private final Executor mThreadExecutor = Executors.newFixedThreadPool(2);
-    private final Size mMaxPreviewSize = new Size(MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGHT);
     private final ConditionVariable mServiceReady = new ConditionVariable();
 
     private boolean mTextureViewSetup = false;
     private Size mPreviewSize;
     private DeviceAsWebcamFgService mLocalFgService;
+    private AccessibilityManager mAccessibilityManager;
 
     private FrameLayout mTextureViewContainer;
     private CardView mTextureViewCard;
     private TextureView mTextureView;
+    private View mFocusIndicator;
     private ZoomController mZoomController = null;
     private ImageButton mToggleCameraButton;
+    // A listener to monitor the preview size change events. This might be invoked when toggling
+    // camera or the webcam stream is started after the preview stream.
+    Consumer<Size> mPreviewSizeChangeListener = size -> runOnUiThread(() -> {
+                mPreviewSize = size;
+                setTextureViewScale();
+            }
+    );
+
+    // Listener for when Accessibility service are enabled or disabled.
+    AccessibilityManager.AccessibilityServicesStateChangeListener mAccessibilityListener =
+            accessibilityManager -> {
+                List<AccessibilityServiceInfo> services =
+                        accessibilityManager.getEnabledAccessibilityServiceList(FEEDBACK_ALL_MASK);
+                boolean areServicesEnabled = !services.isEmpty();
+                runOnUiThread(() ->
+                        mZoomController.onAccessibilityServicesEnabled(areServicesEnabled));
+            };
+
 
     /**
      * {@link TextureView.SurfaceTextureListener} handles several lifecycle events on a
@@ -92,17 +123,19 @@ public class DeviceAsWebcamPreview extends Activity {
                         }
                         if (mLocalFgService != null) {
                             mLocalFgService.setOnDestroyedCallback(() -> onServiceDestroyed());
-                            mLocalFgService.setPreviewSurfaceTexture(texture);
-                            if (mLocalFgService.canToggleCamera()) {
-                                mToggleCameraButton.setVisibility(View.VISIBLE);
-                                mToggleCameraButton.setOnClickListener(v -> toggleCamera());
-                            } else {
-                                mToggleCameraButton.setVisibility(View.GONE);
+                            if (mPreviewSize != null) {
+                                mLocalFgService.setPreviewSurfaceTexture(texture, mPreviewSize,
+                                        mPreviewSizeChangeListener);
+                                if (mLocalFgService.canToggleCamera()) {
+                                    mToggleCameraButton.setVisibility(View.VISIBLE);
+                                    mToggleCameraButton.setOnClickListener(v -> toggleCamera());
+                                } else {
+                                    mToggleCameraButton.setVisibility(View.GONE);
+                                }
+                                rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
+                                mLocalFgService.setRotationUpdateListener(
+                                        rotation -> rotateUiByRotationDegrees(rotation));
                             }
-                            rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
-                            mLocalFgService.setRotationUpdateListener(
-                                    rotation -> runOnUiThread(
-                                            () -> rotateUiByRotationDegrees(rotation)));
                         }
                     });
                 }
@@ -166,7 +199,19 @@ public class DeviceAsWebcamPreview extends Activity {
                 }
             };
 
+    private GestureDetector.SimpleOnGestureListener mTapToFocusListener =
+            new GestureDetector.SimpleOnGestureListener() {
+                @Override
+                public boolean onSingleTapUp(MotionEvent motionEvent) {
+                    return tapToFocus(motionEvent);
+                }
+            };
+
     private void setTextureViewScale() {
+        FrameLayout.LayoutParams frameLayout = new FrameLayout.LayoutParams(mPreviewSize.getWidth(),
+                mPreviewSize.getHeight(), Gravity.CENTER);
+        mTextureView.setLayoutParams(frameLayout);
+
         int pWidth = mTextureViewContainer.getWidth();
         int pHeight = mTextureViewContainer.getHeight();
         float scaleYToUnstretched = (float) mPreviewSize.getWidth() / mPreviewSize.getHeight();
@@ -212,9 +257,19 @@ public class DeviceAsWebcamPreview extends Activity {
                 getApplicationContext(), zoomRatioRange, currentZoomRatio,
                 mZoomRatioListener);
 
+        GestureDetector tapToFocusGestureDetector = new GestureDetector(getApplicationContext(),
+                mTapToFocusListener);
+
+        // Restores the focus indicator if tap-to-focus points exist
+        float[] tapToFocusPoints = mLocalFgService.getTapToFocusPoints();
+        if (tapToFocusPoints != null) {
+            showFocusIndicator(tapToFocusPoints);
+        }
+
         mTextureView.setOnTouchListener(
                 (view, event) -> {
                     mMotionEventToZoomRatioConverter.onTouchEvent(event);
+                    tapToFocusGestureDetector.onTouchEvent(event);
                     return true;
                 });
 
@@ -227,6 +282,9 @@ public class DeviceAsWebcamPreview extends Activity {
                     }
                     mMotionEventToZoomRatioConverter.setZoomRatio(value);
                 });
+        if (mAccessibilityManager != null) {
+            mAccessibilityListener.onAccessibilityServicesStateChanged(mAccessibilityManager);
+        }
     }
 
     private void setupZoomRatioSeekBar() {
@@ -274,12 +332,11 @@ public class DeviceAsWebcamPreview extends Activity {
     }
 
     private void setupTextureViewLayout() {
-        mPreviewSize = mLocalFgService.getSuitablePreviewSize(mMaxPreviewSize);
-        FrameLayout.LayoutParams frameLayout = new FrameLayout.LayoutParams(mPreviewSize.getWidth(),
-                mPreviewSize.getHeight(), Gravity.CENTER);
-        mTextureView.setLayoutParams(frameLayout);
-        setTextureViewScale();
-        setupZoomUiControl();
+        mPreviewSize = mLocalFgService.getSuitablePreviewSize();
+        if (mPreviewSize != null) {
+            setTextureViewScale();
+            setupZoomUiControl();
+        }
     }
 
     private void onServiceDestroyed() {
@@ -303,9 +360,15 @@ public class DeviceAsWebcamPreview extends Activity {
         mTextureViewContainer = findViewById(R.id.texture_view_container);
         mTextureViewCard = findViewById(R.id.texture_view_card);
         mTextureView = findViewById(R.id.texture_view);
+        mFocusIndicator = findViewById(R.id.focus_indicator);
+        mFocusIndicator.setBackground(createFocusIndicatorDrawable());
         mToggleCameraButton = findViewById(R.id.toggle_camera_button);
         mZoomController = findViewById(R.id.zoom_ui_controller);
-
+        mAccessibilityManager = getSystemService(AccessibilityManager.class);
+        if (mAccessibilityManager != null) {
+            mAccessibilityManager.addAccessibilityServicesStateChangeListener(
+                    mAccessibilityListener);
+        }
         // Update view to allow for status bar. This let's us keep a consistent background color
         // behind the statusbar.
         mTextureViewContainer.setOnApplyWindowInsetsListener((view, inset) -> {
@@ -322,6 +385,25 @@ public class DeviceAsWebcamPreview extends Activity {
 
         bindService(new Intent(this, DeviceAsWebcamFgService.class), 0, mThreadExecutor,
                 mConnection);
+    }
+
+    private Drawable createFocusIndicatorDrawable() {
+        int indicatorSize = getResources().getDimensionPixelSize(R.dimen.focus_indicator_size);
+        Bitmap bitmap = Bitmap.createBitmap(indicatorSize, indicatorSize, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+
+        OvalShape ovalShape = new OvalShape();
+        ShapeDrawable shapeDrawable = new ShapeDrawable(ovalShape);
+        Paint paint = shapeDrawable.getPaint();
+        paint.setAntiAlias(true);
+        paint.setColor(getResources().getColor(R.color.focus_indicator_background_color, null));
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(3);
+
+        int circleRadius = indicatorSize / 2;
+        canvas.drawCircle(circleRadius, circleRadius, circleRadius - 1, paint);
+
+        return new BitmapDrawable(getResources(), bitmap);
     }
 
     private void hideSystemUiAndActionBar() {
@@ -353,8 +435,9 @@ public class DeviceAsWebcamPreview extends Activity {
                 setupTextureViewLayout();
                 mTextureViewSetup = true;
             }
-            if (mLocalFgService != null) {
-                mLocalFgService.setPreviewSurfaceTexture(mTextureView.getSurfaceTexture());
+            if (mLocalFgService != null && mPreviewSize != null) {
+                mLocalFgService.setPreviewSurfaceTexture(mTextureView.getSurfaceTexture(),
+                        mPreviewSize, mPreviewSizeChangeListener);
                 rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
                 mLocalFgService.setRotationUpdateListener(rotation ->
                         runOnUiThread(() -> rotateUiByRotationDegrees(rotation)));
@@ -377,6 +460,10 @@ public class DeviceAsWebcamPreview extends Activity {
 
     @Override
     public void onDestroy() {
+        if (mAccessibilityManager != null) {
+            mAccessibilityManager.removeAccessibilityServicesStateChangeListener(
+                    mAccessibilityListener);
+        }
         if (mLocalFgService != null) {
             mLocalFgService.setOnDestroyedCallback(null);
         }
@@ -390,10 +477,76 @@ public class DeviceAsWebcamPreview extends Activity {
         }
 
         mLocalFgService.toggleCamera();
+        mFocusIndicator.setVisibility(View.GONE);
         mMotionEventToZoomRatioConverter.reset(mLocalFgService.getZoomRatio(),
                 mLocalFgService.getCameraInfo().getZoomRatioRange());
         setupZoomRatioSeekBar();
         mZoomController.setZoomRatio(mLocalFgService.getZoomRatio(),
                 ZoomController.ZOOM_UI_TOGGLE_MODE);
+    }
+
+    private boolean tapToFocus(MotionEvent motionEvent) {
+        if (mLocalFgService == null || mLocalFgService.getCameraInfo() == null) {
+            return false;
+        }
+
+        float[] normalizedPoint = calculateNormalizedPoint(motionEvent);
+
+        if (isTapToResetAutoFocus(normalizedPoint)) {
+            mFocusIndicator.setVisibility(View.GONE);
+            mLocalFgService.resetToAutoFocus();
+        } else {
+            showFocusIndicator(normalizedPoint);
+            mLocalFgService.tapToFocus(normalizedPoint);
+        }
+
+        return true;
+    }
+
+    /**
+     * Returns whether the new points overlap with the original tap-to-focus points or not.
+     */
+    private boolean isTapToResetAutoFocus(float[] newNormalizedPoints) {
+        float[] oldNormalizedPoints = mLocalFgService.getTapToFocusPoints();
+
+        if (oldNormalizedPoints == null) {
+            return false;
+        }
+
+        // Calculates the distance between the new and old points
+        float distanceX = Math.abs(newNormalizedPoints[1] - oldNormalizedPoints[1])
+                * mTextureViewCard.getWidth();
+        float distanceY = Math.abs(newNormalizedPoints[0] - oldNormalizedPoints[0])
+                * mTextureViewCard.getHeight();
+        double distance = Math.sqrt(distanceX*distanceX + distanceY*distanceY);
+
+        int indicatorRadius = getResources().getDimensionPixelSize(R.dimen.focus_indicator_size)
+                / 2;
+
+        // Checks whether the distance is less than the circle radius of focus indicator
+        return indicatorRadius >= distance;
+    }
+
+    /**
+     * Calculates the normalized point which will be the point between [0, 0] to [1, 1] mapping to
+     * the preview size.
+     */
+    private float[] calculateNormalizedPoint(MotionEvent motionEvent) {
+        return new float[]{motionEvent.getX() / mPreviewSize.getWidth(),
+                motionEvent.getY() / mPreviewSize.getHeight()};
+    }
+
+    /**
+     * Show the focus indicator and hide it automatically after a proper duration.
+     */
+    private void showFocusIndicator(float[] normalizedPoint) {
+        int indicatorSize = getResources().getDimensionPixelSize(R.dimen.focus_indicator_size);
+        float translationX =
+                normalizedPoint[0] * mTextureViewCard.getWidth() - indicatorSize / 2f;
+        float translationY = normalizedPoint[1] * mTextureViewCard.getHeight()
+                - indicatorSize / 2f;
+        mFocusIndicator.setTranslationX(translationX);
+        mFocusIndicator.setTranslationY(translationY);
+        mFocusIndicator.setVisibility(View.VISIBLE);
     }
 }

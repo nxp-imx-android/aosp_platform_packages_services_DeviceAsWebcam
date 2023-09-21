@@ -16,6 +16,7 @@
 
 package com.android.DeviceAsWebcam;
 
+import android.graphics.Rect;
 import android.util.Range;
 
 import java.util.List;
@@ -28,12 +29,20 @@ public class CameraInfo {
     private final int mSensorOrientation;
     private final Range<Float> mZoomRatioRange;
     private final List<VendorCameraPrefs.PhysicalCameraInfo> mPhysicalCameraInfos;
+    private final Rect mActiveArraySize;
+    private final boolean mFacePrioritySupported;
+    private final boolean mIsStreamUseCaseSupported;
+
     public CameraInfo(int lensFacing, int sensorOrientation, Range<Float> zoomRatioRange,
-            List<VendorCameraPrefs.PhysicalCameraInfo> physicalInfos) {
+            List<VendorCameraPrefs.PhysicalCameraInfo> physicalInfos, Rect activeArraySize,
+            boolean facePrioritySupported, boolean streamUseCaseSupported) {
         mLensFacing = lensFacing;
         mSensorOrientation = sensorOrientation;
         mZoomRatioRange = zoomRatioRange;
         mPhysicalCameraInfos = physicalInfos;
+        mActiveArraySize = activeArraySize;
+        mFacePrioritySupported = facePrioritySupported;
+        mIsStreamUseCaseSupported = streamUseCaseSupported;
     }
 
     /**
@@ -60,4 +69,26 @@ public class CameraInfo {
     public List<VendorCameraPrefs.PhysicalCameraInfo> getPhysicalCameraInfos() {
         return mPhysicalCameraInfos;
     }
+
+    /**
+     * Returns active array size characteristics value.
+     */
+    public Rect getActiveArraySize() {
+        return mActiveArraySize;
+    }
+
+    /**
+     * Returns if CONTROL_SCENE_MODE_FACE_PRIORITY is supported.
+     */
+    public boolean isFacePrioritySupported() {
+        return mFacePrioritySupported;
+    }
+
+    /**
+     * Returns if STRAEM_USE_CASE capability is present.
+     */
+    public boolean isStreamUseCaseSupported() {
+        return mIsStreamUseCaseSupported;
+    }
+
 }

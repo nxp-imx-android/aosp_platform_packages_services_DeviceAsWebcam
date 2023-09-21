@@ -17,6 +17,12 @@
 package com.android.DeviceAsWebcam;
 
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Matrix;
+import android.graphics.Point;
+import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
 import android.hardware.HardwareBuffer;
 import android.hardware.camera2.CameraAccessException;
@@ -26,16 +32,23 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.MeteringRectangle;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
+import android.hardware.camera2.params.StreamConfigurationMap;
+import android.hardware.display.DisplayManager;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.ImageWriter;
 import android.os.ConditionVariable;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.ArrayMap;
 import android.util.Log;
 import android.util.Range;
+import android.util.Rational;
+import android.util.Size;
+import android.view.Display;
 import android.view.Surface;
 
 import androidx.annotation.NonNull;
@@ -43,12 +56,18 @@ import androidx.annotation.NonNull;
 import com.android.DeviceAsWebcam.utils.UserPrefs;
 
 import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
  * This class controls the operation of the camera - primarily through the public calls
@@ -67,18 +86,42 @@ public class CameraController {
     private static final String TAG = "CameraController";
     private static final boolean VERBOSE = Log.isLoggable(TAG, Log.VERBOSE);
 
-    private static final int NO_STREAMING = 0;
-    private static final int WEBCAM_STREAMING = 1;
-    private static final int PREVIEW_STREAMING = 2;
-    private static final int PREVIEW_AND_WEBCAM_STREAMING = 3;
+    // Camera session state - when camera is actually being used
+    enum CameraStreamingState {
+        NO_STREAMING,
+        WEBCAM_STREAMING,
+        PREVIEW_STREAMING,
+        PREVIEW_AND_WEBCAM_STREAMING
+    };
+
+    // Camera availability states
+    enum CameraAvailabilityState {
+        AVAILABLE,
+        IN_USE,
+        WAITING_FOR_AVAILABLE,
+        WAITING_FOR_UNAVAILABLE,
+        EVICTED
+    };
 
     private static final int MAX_BUFFERS = 4;
+    // The ratio to the active array size that will be used to determine the metering rectangle
+    // size.
+    private static final float METERING_RECTANGLE_SIZE_RATIO = 0.15f;
 
     private String mBackCameraId = null;
     private String mFrontCameraId = null;
 
     private ImageReader mImgReader;
-    private int mCurrentState = NO_STREAMING;
+    private ImageWriter mImageWriter;
+
+    // current camera session state
+    private CameraStreamingState mCurrentState = CameraStreamingState.NO_STREAMING;
+
+    // current camera availability state - to be accessed only from camera related callbacks which
+    // execute on mCameraCallbacksExecutor. This isn't a part of mCameraInfo since that is static
+    // information about a camera and has looser thread access requirements.
+    private ArrayMap<String, CameraAvailabilityState> mCameraAvailabilityState = new ArrayMap<>();
+
     private Context mContext;
     private WeakReference<DeviceAsWebcamFgService> mServiceWeak;
     private CaptureRequest.Builder mPreviewRequestBuilder;
@@ -87,22 +130,51 @@ public class CameraController {
     private Handler mImageReaderHandler;
     private Executor mCameraCallbacksExecutor;
     private Executor mServiceEventsExecutor;
+    private SurfaceTexture mPreviewSurfaceTexture;
+    /**
+     * Registered by the Preview Activity, and called by CameraController when preview size changes
+     * as a result of the webcam stream changing.
+     */
+    private Consumer<Size> mPreviewSizeChangeListener;
     private Surface mPreviewSurface;
+    private Size mDisplaySize;
+    private Size mPreviewSize;
+    // Executor for ImageWriter thread - used when camera is evicted and webcam is streaming.
+    private ScheduledExecutorService mImageWriterEventsExecutor;
+
+    // This is set up only when we need to show the camera access blocked logo and reset
+    // when camera is available again - since its going to be a rare occurrence that camera is
+    // actually evicted when webcam is streaming.
+    private byte[] mCombinedBitmapBytes;
+
     private OutputConfiguration mPreviewOutputConfiguration;
     private OutputConfiguration mWebcamOutputConfiguration;
     private List<OutputConfiguration> mOutputConfigurations;
     private CameraCaptureSession mCaptureSession;
-    private ConditionVariable mCameraOpened = new ConditionVariable();
+    private ConditionVariable mReadyToStream = new ConditionVariable();
     private ConditionVariable mCaptureSessionReady = new ConditionVariable();
     private AtomicBoolean mStartCaptureWebcamStream = new AtomicBoolean(false);
     private final Object mSerializationLock = new Object();
     // timestamp -> Image
     private ConcurrentHashMap<Long, ImageAndBuffer> mImageMap = new ConcurrentHashMap<>();
-    private int mFps;
     // TODO(b/267794640): UI to select camera id
     private String mCameraId = null;
     private ArrayMap<String, CameraInfo> mCameraInfoMap = new ArrayMap<>();
+    private float[] mTapToFocusPoints = null;
+    private static class StreamConfigs {
+        StreamConfigs(boolean mjpegP, int widthP, int heightP, int fpsP) {
+            isMjpeg = mjpegP;
+            width = widthP;
+            height = heightP;
+            fps = fpsP;
+        }
 
+        boolean isMjpeg;
+        int width;
+        int height;
+        int fps;
+    };
+    private StreamConfigs mStreamConfigs;
     private CameraDevice.StateCallback mCameraStateCallback = new CameraDevice.StateCallback() {
         @Override
         public void onOpened(@NonNull CameraDevice cameraDevice) {
@@ -110,16 +182,44 @@ public class CameraController {
                 Log.v(TAG, "Camera device opened, creating capture session now");
             }
             mCameraDevice = cameraDevice;
-            mCameraOpened.open();
+            mCameraAvailabilityState.put(cameraDevice.getId(), CameraAvailabilityState.IN_USE);
+            mReadyToStream.open();
         }
 
         @Override
         public void onDisconnected(CameraDevice cameraDevice) {
-            mCameraDevice = null;
+            if (VERBOSE) {
+                Log.v(TAG, "onDisconnected: " + cameraDevice.getId() + " camera available state "
+                        + mCameraAvailabilityState.get(cameraDevice.getId()));
+            }
+            synchronized (mSerializationLock) {
+                // In this case we got disconnected due to an eviction, in the other case the camera
+                // got disconnected to an onError callback - for example when there is a camera HAL
+                // or service crash.
+                if (mCameraAvailabilityState.get(cameraDevice.getId()) !=
+                        CameraAvailabilityState.WAITING_FOR_AVAILABLE) {
+                    mCameraAvailabilityState.put(cameraDevice.getId(),
+                            CameraAvailabilityState.EVICTED);
+                }
+                mCameraDevice = null;
+                stopStreamingAltogetherLocked(/*closeImageReader*/false);
+                if (mStartCaptureWebcamStream.get()) {
+                    startShowingCameraUnavailableLogo();
+                }
+            }
         }
 
         @Override
         public void onError(@NonNull CameraDevice cameraDevice, int error) {
+            if (VERBOSE) {
+                Log.e(TAG, "Camera : onError " + error);
+            }
+            mCameraAvailabilityState.put(
+                    cameraDevice.getId(), CameraAvailabilityState.WAITING_FOR_AVAILABLE);
+            mReadyToStream.open();
+            if (mStartCaptureWebcamStream.get()) {
+                startShowingCameraUnavailableLogo();
+            }
         }
     };
     private CameraCaptureSession.CaptureCallback mCaptureCallback =
@@ -134,10 +234,9 @@ public class CameraController {
                     }
                     mCaptureSession = cameraCaptureSession;
                     try {
-                            mCaptureSession.setSingleRepeatingRequest(
-                                    mPreviewRequestBuilder.build(), mCameraCallbacksExecutor,
-                                    mCaptureCallback);
-
+                        mCaptureSession.setSingleRepeatingRequest(
+                                mPreviewRequestBuilder.build(), mCameraCallbacksExecutor,
+                                mCaptureCallback);
                     } catch (CameraAccessException e) {
                         Log.e(TAG, "setSingleRepeatingRequest failed", e);
                     }
@@ -149,6 +248,64 @@ public class CameraController {
                     Log.e(TAG, "Failed to configure CameraCaptureSession");
                 }
             };
+
+    // For the camera availability callbacks, we need to keep track of the 'state'
+    // of callbacks since the camera api sends clients the following order of callbacks once
+    // it gets evicted by a higher priority callback :
+    //  1. onDisconnected()
+    //  2. onCameraAvailable() followed immediately by
+    //  3. onCameraUnavailable().
+    //  4. When the higher priority client closes the camera, the lower priority client also
+    //     receives an onCameraAvailable() callback.
+    //  So in order to distinguish between the onCameraAvailable() callbacks in 2. and 4. we need to
+    //  keep track of the state we're in.
+    private CameraManager.AvailabilityCallback mCameraAvailabilityCallbacks =
+            new CameraManager.AvailabilityCallback() {
+        @Override
+        public void onCameraAvailable(String cameraId) {
+            mCameraAvailabilityState.putIfAbsent(cameraId, CameraAvailabilityState.AVAILABLE);
+            switch (mCameraAvailabilityState.get(cameraId)) {
+                case EVICTED:
+                    mCameraAvailabilityState.put(
+                            cameraId, CameraAvailabilityState.WAITING_FOR_UNAVAILABLE);
+                    break;
+                case WAITING_FOR_AVAILABLE:
+                    if (mStartCaptureWebcamStream.get() && cameraId.equals(mCameraId)) {
+                        if (VERBOSE) {
+                            Log.v(TAG, "Camera is available : starting webcam stream for camera id "
+                                    + cameraId);
+                        }
+                        stopShowingCameraUnavailableLogo();
+                        setWebcamStreamConfig(mStreamConfigs.isMjpeg, mStreamConfigs.width,
+                                mStreamConfigs.height, mStreamConfigs.fps);
+                        startWebcamStreaming();
+                        mCameraAvailabilityState.put(
+                                cameraId, CameraAvailabilityState.IN_USE);
+                    } else {
+                        mCameraAvailabilityState.put(
+                            cameraId, CameraAvailabilityState.AVAILABLE);
+                    }
+                    break;
+                default:
+                    mCameraAvailabilityState.put(
+                        cameraId, CameraAvailabilityState.AVAILABLE);
+            }
+            if (VERBOSE) {
+                Log.v(TAG, "onCameraAvailable: " + cameraId + " camera available state "
+                        + mCameraAvailabilityState.get(cameraId));
+            }
+        }
+
+        @Override
+        public void onCameraUnavailable(String cameraId) {
+            // We're unconditionally waiting for available - mStartCaptureWebcamStream will decide
+            // whether we need to do anything about it.
+            if (VERBOSE) {
+                Log.v(TAG, "Camera id " + cameraId + " unavailable");
+            }
+            mCameraAvailabilityState.put(cameraId, CameraAvailabilityState.WAITING_FOR_AVAILABLE);
+        }
+    };
 
     private ImageReader.OnImageAvailableListener mOnImageAvailableListener =
             new ImageReader.OnImageAvailableListener() {
@@ -168,7 +325,8 @@ public class CameraController {
                     // Acquire latest Image and get the HardwareBuffer
                     Image image = reader.acquireLatestImage();
                     if (VERBOSE) {
-                        Log.v(TAG, "Got acquired Image in onImageAvailable callback");
+                        Log.v(TAG, "Got acquired Image in onImageAvailable callback for reader "
+                                + reader);
                     }
                     if (image == null) {
                         if (VERBOSE) {
@@ -208,6 +366,9 @@ public class CameraController {
         }
         startBackgroundThread();
         mCameraManager = mContext.getSystemService(CameraManager.class);
+        mDisplaySize = getDisplayPreviewSize();
+        mCameraManager.registerAvailabilityCallback(
+                mCameraCallbacksExecutor, mCameraAvailabilityCallbacks);
         refreshLensFacingCameraIds();
 
         mUserPrefs = new UserPrefs(mContext);
@@ -226,6 +387,58 @@ public class CameraController {
         });
     }
 
+    private void convertARGBToRGBA(ByteBuffer argb) {
+        // Android Bitmap.Config.ARGB_8888 is laid out as RGBA in an int and java ByteBuffer by
+        // default is big endian.
+        for (int i = 0; i < argb.capacity(); i+= 4) {
+            byte r = argb.get(i);
+            byte g = argb.get(i + 1);
+            byte b = argb.get(i + 2);
+            byte a = argb.get(i + 3);
+
+            //libyuv expects BGRA
+            argb.put(i, b);
+            argb.put(i + 1, g);
+            argb.put(i + 2, r);
+            argb.put(i + 3, a);
+        }
+    }
+
+    private void setupBitmaps(int width, int height) {
+        // Initialize logoBitmap. Should fit 'in' enclosed by any webcam stream
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        // We want 1/2 of the screen being covered by the camera blocked logo
+        Bitmap logoBitmap =
+                BitmapFactory.decodeResource(mContext.getResources(),
+                        R.drawable.camera_access_blocked, options);
+        int scaledWidth, scaledHeight;
+        if (logoBitmap.getWidth() > logoBitmap.getHeight()) {
+            scaledWidth = (int)(0.5 * width);
+            scaledHeight =
+                    (int)(scaledWidth * (float)logoBitmap.getHeight() / logoBitmap.getWidth());
+        } else {
+            scaledHeight = (int)(0.5 * height);
+            scaledWidth =
+                    (int)(scaledHeight * (float)logoBitmap.getWidth() / logoBitmap.getHeight());
+        }
+        // Combined Bitmap which will hold background + camera access blocked image
+        Bitmap combinedBitmap =
+                Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(combinedBitmap);
+        // Offsets to start composed image from
+        int offsetX = (width - scaledWidth) / 2;
+        int offsetY = (height - scaledHeight)/ 2;
+        int endX = offsetX + scaledWidth;
+        int endY = offsetY + scaledHeight;
+        canvas.drawBitmap(logoBitmap,
+                new Rect(0, 0, logoBitmap.getWidth(), logoBitmap.getHeight()),
+                new Rect(offsetX, offsetY, endX, endY), null);
+        ByteBuffer byteBuffer = ByteBuffer.allocate(combinedBitmap.getByteCount());
+        combinedBitmap.copyPixelsToBuffer(byteBuffer);
+        convertARGBToRGBA(byteBuffer);
+        mCombinedBitmapBytes = byteBuffer.array();
+    }
     private void refreshLensFacingCameraIds() {
         VendorCameraPrefs rroCameraInfo =
                 VendorCameraPrefs.getVendorCameraPrefsFromJson(mContext);
@@ -256,25 +469,45 @@ public class CameraController {
         String workingCameraId =
                 (physicalInfos != null && !physicalInfos.isEmpty()) ? physicalInfos.get(
                         0).physicalCameraId : cameraId;
-        return cameraId == null ? null : new CameraInfo(
-                getCameraCharacteristic(cameraId, CameraCharacteristics.LENS_FACING),
-                getCameraCharacteristic(cameraId, CameraCharacteristics.SENSOR_ORIENTATION),
+        CameraCharacteristics chars = getCameraCharacteristicsOrNull(cameraId);
+        CameraCharacteristics physicalChars = getCameraCharacteristicsOrNull(workingCameraId);
+        // We should consider using a builder pattern here if the parameters grow a lot.
+        return new CameraInfo(
+                getCameraCharacteristic(chars, CameraCharacteristics.LENS_FACING),
+                getCameraCharacteristic(chars, CameraCharacteristics.SENSOR_ORIENTATION),
                 // TODO: b/269644311 Need to find a way to correct the available zoom ratio range
                 //  when a specific physical camera is used.
-                getCameraCharacteristic(workingCameraId,
+                getCameraCharacteristic(physicalChars,
                         CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE),
-                physicalInfos
+                physicalInfos,
+                getCameraCharacteristic(chars,
+                        CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
+                isFacePrioritySupported(chars),
+                isStreamUseCaseSupported(chars)
         );
     }
 
-    private <T> T getCameraCharacteristic(String cameraId, CameraCharacteristics.Key<T> key) {
+    private static <T> T getCameraCharacteristic(CameraCharacteristics chars,
+            CameraCharacteristics.Key<T> key) {
+        return chars.get(key);
+    }
+
+    private CameraCharacteristics getCameraCharacteristicsOrNull(String cameraId) {
         try {
             CameraCharacteristics characteristics = mCameraManager.getCameraCharacteristics(
                     cameraId);
-            return characteristics.get(key);
+            return characteristics;
         } catch (CameraAccessException e) {
-            Log.e(TAG, "Failed to get" + key.getName() + "characteristics for camera " + cameraId
-                    + ".");
+            Log.e(TAG, "Failed to get characteristics for camera " + cameraId
+                    + ".", e);
+        }
+      return null;
+    }
+
+    private <T> T getCameraCharacteristic(String cameraId, CameraCharacteristics.Key<T> key) {
+        CameraCharacteristics chars = getCameraCharacteristicsOrNull(cameraId);
+        if (chars != null) {
+            return chars.get(key);
         }
         return null;
     }
@@ -286,7 +519,10 @@ public class CameraController {
         }
         synchronized (mSerializationLock) {
             long usage = HardwareBuffer.USAGE_CPU_READ_OFTEN;
-            mFps = fps;
+            mStreamConfigs = new StreamConfigs(mjpeg, width, height, fps);
+            if (mImgReader != null) {
+                mImgReader.close();
+            }
             mImgReader = new ImageReader.Builder(width, height)
                     .setMaxImages(MAX_BUFFERS)
                     .setDefaultHardwareBufferFormat(HardwareBuffer.YCBCR_420_888)
@@ -294,7 +530,56 @@ public class CameraController {
                     .build();
             mImgReader.setOnImageAvailableListener(mOnImageAvailableListener,
                     mImageReaderHandler);
+        }
+    }
 
+    private void fillImageWithCameraAccessBlockedLogo(Image img) {
+        Image.Plane[] planes = img.getPlanes();
+
+        ByteBuffer rgbaBuffer = planes[0].getBuffer();
+        // Copy the bitmap array
+        rgbaBuffer.put(mCombinedBitmapBytes);
+    }
+
+    private void stopShowingCameraUnavailableLogo() {
+        // destroy the executor since camera getting evicted would be a rare occurrence
+        synchronized (mSerializationLock) {
+            mImageWriterEventsExecutor.shutdown();
+            mImageWriterEventsExecutor = null;
+            mImageWriter = null;
+            mCombinedBitmapBytes = null;
+        }
+    }
+
+    private void startShowingCameraUnavailableLogo() {
+        synchronized (mSerializationLock) {
+            setupBitmaps(mStreamConfigs.width, mStreamConfigs.height);
+            long usage = HardwareBuffer.USAGE_CPU_READ_OFTEN;
+            if (mImgReader != null) {
+                mImgReader.close();
+            }
+            mImgReader = new ImageReader.Builder(
+                            mStreamConfigs.width, mStreamConfigs.height)
+                    .setMaxImages(MAX_BUFFERS)
+                    .setDefaultHardwareBufferFormat(HardwareBuffer.RGBA_8888)
+                    .setUsage(usage)
+                    .build();
+
+            mImgReader.setOnImageAvailableListener(mOnImageAvailableListener,
+                    mImageReaderHandler);
+            mImageWriter = ImageWriter.newInstance(mImgReader.getSurface(), MAX_BUFFERS);
+            // In effect, the webcam stream has started
+            mImageWriterEventsExecutor = Executors.newScheduledThreadPool(1);
+            mImageWriterEventsExecutor.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    Image img = mImageWriter.dequeueInputImage();
+                    // Fill in image
+                    fillImageWithCameraAccessBlockedLogo(img);
+                    mImageWriter.queueInputImage(img);
+                }
+            }, /*initialDelay*/0, /*fps period ms*/1000 / mStreamConfigs.fps,
+                    TimeUnit.MILLISECONDS);
         }
     }
 
@@ -318,9 +603,10 @@ public class CameraController {
             mCameraManager.openCamera(mCameraId, mCameraCallbacksExecutor, mCameraStateCallback);
         } catch (CameraAccessException e) {
             Log.e(TAG, "openCamera failed for cameraId : " + mCameraId, e);
+            startShowingCameraUnavailableLogo();
         }
-        mCameraOpened.block();
-        mCameraOpened.close();
+        mReadyToStream.block();
+        mReadyToStream.close();
     }
 
     private void setupPreviewOnlyStreamLocked(SurfaceTexture previewSurfaceTexture) {
@@ -329,30 +615,118 @@ public class CameraController {
 
     private void setupPreviewOnlyStreamLocked(Surface previewSurface) {
         mPreviewSurface = previewSurface;
+        openCameraBlocking();
+        mPreviewRequestBuilder = createInitialPreviewRequestBuilder(mPreviewSurface);
+        if (mPreviewRequestBuilder == null) {
+            return;
+        }
+        mPreviewOutputConfiguration = new OutputConfiguration(mPreviewSurface);
+        if (mCameraInfo.isStreamUseCaseSupported() && shouldUseStreamUseCase()) {
+            mPreviewOutputConfiguration.setStreamUseCase(
+                    CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW);
+        }
+
+        // So that we don't have to reconfigure if / when the preview activity is turned off /
+        // on again.
+        mWebcamOutputConfiguration = null;
+        mOutputConfigurations = Arrays.asList(mPreviewOutputConfiguration);
+        mCurrentState = CameraStreamingState.PREVIEW_STREAMING;
+        createCaptureSessionBlocking();
+    }
+
+    private CaptureRequest.Builder createInitialPreviewRequestBuilder(Surface targetSurface) {
+        CaptureRequest.Builder captureRequestBuilder;
         try {
-            openCameraBlocking();
-            mPreviewRequestBuilder =
+            captureRequestBuilder =
                     mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-
-            Range<Integer> fpsRange;
-            if (mFps != 0) {
-                fpsRange = new Range<>(mFps, mFps);
-            } else {
-                fpsRange = new Range<>(30, 30);
-            }
-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, mZoomRatio);
-            mPreviewOutputConfiguration = new OutputConfiguration(mPreviewSurface);
-            mPreviewRequestBuilder.addTarget(mPreviewSurface);
-            // So that we don't have to reconfigure if / when the preview activity is turned off /
-            // on again.
-
-            mOutputConfigurations = Arrays.asList(mPreviewOutputConfiguration);
-            createCaptureSessionBlocking();
-            mCurrentState = PREVIEW_STREAMING;
         } catch (CameraAccessException e) {
             Log.e(TAG, "createCaptureRequest failed", e);
+            return null;
         }
+
+        int currentFps = 30;
+        if (mStreamConfigs != null) {
+            currentFps = mStreamConfigs.fps;
+        }
+        Range<Integer> fpsRange;
+        if (currentFps != 0) {
+            fpsRange = new Range<>(currentFps, currentFps);
+        } else {
+            fpsRange = new Range<>(30, 30);
+        }
+        captureRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
+        captureRequestBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, mZoomRatio);
+        captureRequestBuilder.addTarget(targetSurface);
+        captureRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+        if (mCameraInfo.isFacePrioritySupported()) {
+            captureRequestBuilder.set(CaptureRequest.CONTROL_SCENE_MODE,
+                    CaptureRequest.CONTROL_SCENE_MODE_FACE_PRIORITY);
+        }
+
+        return captureRequestBuilder;
+    }
+
+    private static boolean checkArrayContains(int[] array, int value) {
+        if (array == null) {
+            return false;
+        }
+        for (int val : array) {
+            if (val == value) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean isFacePrioritySupported(CameraCharacteristics chars) {
+        int[] availableSceneModes = getCameraCharacteristic(chars,
+                CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES);
+        return checkArrayContains(
+                availableSceneModes, CaptureRequest.CONTROL_SCENE_MODE_FACE_PRIORITY);
+    }
+
+    private static boolean isStreamUseCaseSupported(CameraCharacteristics chars) {
+        int[] caps = getCameraCharacteristic(chars,
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+        return checkArrayContains(
+                caps, CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_STREAM_USE_CASE);
+    }
+
+    // CameraManager which populates the mandatory streams uses the same computation.
+    private Size getDisplayPreviewSize() {
+        Size ret = new Size(1920, 1080);
+        DisplayManager displayManager =
+                mContext.getSystemService(DisplayManager.class);
+        Display display = displayManager.getDisplay(Display.DEFAULT_DISPLAY);
+        if (display != null) {
+            Point sz = new Point();
+            display.getRealSize(sz);
+            int width = sz.x;
+            int height = sz.y;
+
+            if (height > width) {
+                height = width;
+                width = sz.y;
+            }
+            ret = new Size(width, height);
+        } else {
+            Log.e(TAG, "Invalid default display!");
+        }
+        return ret;
+    }
+
+    // Check whether we satisfy mandatory stream combinations for stream use use case
+    private boolean shouldUseStreamUseCase() {
+        // Webcam stream - YUV should be <= 1440p
+        // Preview stream should be <= PREVIEW - which is already guaranteed by
+        // getSuitablePreviewSize()
+        if (mWebcamOutputConfiguration != null && mStreamConfigs != null &&
+                (mStreamConfigs.width * mStreamConfigs.height) > (1920 * 1440)) {
+            return false;
+        }
+        return true;
     }
 
     private void setupPreviewStreamAlongsideWebcamStreamLocked(
@@ -366,20 +740,29 @@ public class CameraController {
         }
         mPreviewSurface = previewSurface;
         mPreviewOutputConfiguration = new OutputConfiguration(mPreviewSurface);
+        if (mCameraInfo.isStreamUseCaseSupported() && shouldUseStreamUseCase()) {
+            mPreviewOutputConfiguration.setStreamUseCase(
+                    CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW);
+        }
+
         mPreviewRequestBuilder.addTarget(mPreviewSurface);
         mOutputConfigurations = Arrays.asList(mPreviewOutputConfiguration,
                 mWebcamOutputConfiguration);
+        mCurrentState = CameraStreamingState.PREVIEW_AND_WEBCAM_STREAMING;
         createCaptureSessionBlocking();
-        mCurrentState = PREVIEW_AND_WEBCAM_STREAMING;
     }
 
-    public void startPreviewStreaming(SurfaceTexture surfaceTexture) {
+    public void startPreviewStreaming(SurfaceTexture surfaceTexture, Size previewSize,
+            Consumer<Size> previewSizeChangeListener) {
         // Started on a background thread since we don't want to be blocking either the activity's
         // or the service's main thread (we call blocking camera open in these methods internally)
         mServiceEventsExecutor.execute(new Runnable() {
             @Override
             public void run() {
                 synchronized (mSerializationLock) {
+                    mPreviewSurfaceTexture = surfaceTexture;
+                    mPreviewSize = previewSize;
+                    mPreviewSizeChangeListener = previewSizeChangeListener;
                     switch (mCurrentState) {
                         case NO_STREAMING:
                             setupPreviewOnlyStreamLocked(surfaceTexture);
@@ -403,21 +786,21 @@ public class CameraController {
             Log.v(TAG, "setupWebcamOnly");
         }
         Surface surface = mImgReader.getSurface();
-        try {
-            openCameraBlocking();
-            mPreviewRequestBuilder =
-                    mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            Range<Integer> fpsRange = new Range<>(mFps, mFps);
-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, mZoomRatio);
-            mPreviewRequestBuilder.addTarget(surface);
+        openCameraBlocking();
+        mCurrentState = CameraStreamingState.WEBCAM_STREAMING;
+        if (mCameraDevice != null) {
+            mPreviewRequestBuilder = createInitialPreviewRequestBuilder(surface);
+            if (mPreviewRequestBuilder == null) {
+                Log.e(TAG, "Failed to create the webcam stream.");
+                return;
+            }
             mWebcamOutputConfiguration = new OutputConfiguration(surface);
-            mOutputConfigurations =
-                    Arrays.asList(mWebcamOutputConfiguration);
+            if (mCameraInfo.isStreamUseCaseSupported() && shouldUseStreamUseCase()) {
+                mWebcamOutputConfiguration.setStreamUseCase(
+                        CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL);
+            }
+            mOutputConfigurations = Arrays.asList(mWebcamOutputConfiguration);
             createCaptureSessionBlocking();
-            mCurrentState = WEBCAM_STREAMING;
-        } catch (CameraAccessException e) {
-            Log.e(TAG, "createCaptureRequest failed", e);
         }
     }
 
@@ -429,10 +812,52 @@ public class CameraController {
         Surface surface = mImgReader.getSurface();
         mPreviewRequestBuilder.addTarget(surface);
         mWebcamOutputConfiguration = new OutputConfiguration(surface);
+        if (mCameraInfo.isStreamUseCaseSupported() && shouldUseStreamUseCase()) {
+            mWebcamOutputConfiguration.setStreamUseCase(
+                    CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL);
+        }
+        mCurrentState = CameraStreamingState.PREVIEW_AND_WEBCAM_STREAMING;
         mOutputConfigurations =
                 Arrays.asList(mWebcamOutputConfiguration, mPreviewOutputConfiguration);
         createCaptureSessionBlocking();
-        mCurrentState = PREVIEW_AND_WEBCAM_STREAMING;
+    }
+
+    /**
+     * Adjust preview output configuration when preview size is changed.
+     */
+    private void adjustPreviewOutputConfiguration() {
+        if (mPreviewSurfaceTexture == null || mPreviewSurface == null) {
+            return;
+        }
+
+        Size suitablePreviewSize = getSuitablePreviewSize();
+        // If the required preview size is the same, don't need to adjust the output configuration
+        if (Objects.equals(suitablePreviewSize, mPreviewSize)) {
+            return;
+        }
+
+        // Removes the original preview surface
+        mPreviewRequestBuilder.removeTarget(mPreviewSurface);
+        // Adjusts the SurfaceTexture default buffer size to match the new preview size
+        mPreviewSurfaceTexture.setDefaultBufferSize(suitablePreviewSize.getWidth(),
+                suitablePreviewSize.getHeight());
+        mPreviewSize = suitablePreviewSize;
+        mPreviewRequestBuilder.addTarget(mPreviewSurface);
+        mPreviewOutputConfiguration = new OutputConfiguration(mPreviewSurface);
+        if (mCameraInfo.isStreamUseCaseSupported()) {
+                mPreviewOutputConfiguration.setStreamUseCase(
+                        CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW);
+        }
+
+        mOutputConfigurations = mWebcamOutputConfiguration != null ? Arrays.asList(
+                mWebcamOutputConfiguration, mPreviewOutputConfiguration) : Arrays.asList(
+                mPreviewOutputConfiguration);
+
+        // Invokes the preview size change listener so that the preview activity can adjust its
+        // size and scale to match the new size.
+        if (mPreviewSizeChangeListener != null) {
+            mPreviewSizeChangeListener.accept(suitablePreviewSize);
+        }
     }
 
     public void startWebcamStreaming() {
@@ -447,17 +872,22 @@ public class CameraController {
                     return;
                 }
                 switch (mCurrentState) {
+                    // Our current state could also be webcam streaming and we want to start the
+                    // camera again - example : we never had the camera and were streaming the
+                    // camera unavailable logo - when camera becomes available we actually want to
+                    // start streaming camera frames.
+                    case WEBCAM_STREAMING:
                     case NO_STREAMING:
                         setupWebcamOnlyStreamAndOpenCameraLocked();
                         break;
                     case PREVIEW_STREAMING:
+                        adjustPreviewOutputConfiguration();
                         // Its okay to recreate an already running camera session with
                         // preview since the 'glitch' that we see will not be on the webcam
                         // stream.
                         setupWebcamStreamAndReconfigureSessionLocked();
                         break;
                     case PREVIEW_AND_WEBCAM_STREAMING:
-                    case WEBCAM_STREAMING:
                         Log.e(TAG, "Incorrect current state for startWebcamStreaming "
                                 + mCurrentState);
                 }
@@ -469,8 +899,11 @@ public class CameraController {
         mPreviewRequestBuilder.removeTarget(mPreviewSurface);
         mOutputConfigurations = Arrays.asList(mWebcamOutputConfiguration);
         createCaptureSessionBlocking();
+        mPreviewSurfaceTexture = null;
+        mPreviewSizeChangeListener = null;
         mPreviewSurface = null;
-        mCurrentState = WEBCAM_STREAMING;
+        mPreviewSize = null;
+        mCurrentState = CameraStreamingState.WEBCAM_STREAMING;
     }
 
     public void stopPreviewStreaming() {
@@ -504,24 +937,32 @@ public class CameraController {
         mPreviewRequestBuilder.removeTarget(mImgReader.getSurface());
         mOutputConfigurations =
                 Arrays.asList(mPreviewOutputConfiguration);
-        createCaptureSessionBlocking();
+        mCurrentState = CameraStreamingState.PREVIEW_STREAMING;
         mWebcamOutputConfiguration = null;
-        mCurrentState = PREVIEW_STREAMING;
+        createCaptureSessionBlocking();
     }
 
     private void stopStreamingAltogetherLocked() {
+        stopStreamingAltogetherLocked(/*closeImageReader*/true);
+    }
+
+    private void stopStreamingAltogetherLocked(boolean closeImageReader) {
         if (VERBOSE) {
             Log.v(TAG, "StopStreamingAltogether");
         }
-        if (mImgReader != null) {
+        mCurrentState = CameraStreamingState.NO_STREAMING;
+        if (closeImageReader && mImgReader != null) {
             mImgReader.close();
+            mImgReader = null;
         }
-        mCameraDevice.close();
+        if (mCameraDevice != null) {
+            mCameraDevice.close();
+        }
         mCameraDevice = null;
-        mImgReader = null;
         mWebcamOutputConfiguration = null;
         mPreviewOutputConfiguration = null;
-        mCurrentState = NO_STREAMING;
+        mTapToFocusPoints = null;
+        mReadyToStream.close();
     }
 
     public void stopWebcamStreaming() {
@@ -530,6 +971,7 @@ public class CameraController {
         mServiceEventsExecutor.execute(new Runnable() {
             @Override
             public void run() {
+                mStartCaptureWebcamStream.set(false);
                 synchronized (mSerializationLock) {
                     switch (mCurrentState) {
                         case PREVIEW_AND_WEBCAM_STREAMING:
@@ -539,14 +981,16 @@ public class CameraController {
                             stopStreamingAltogetherLocked();
                             break;
                         case PREVIEW_STREAMING:
-                        case NO_STREAMING:
                             Log.e(TAG,
                                     "Incorrect current state for stopWebcamStreaming " +
                                             mCurrentState);
                             return;
                     }
+
+                    if (mImageWriterEventsExecutor != null) {
+                        stopShowingCameraUnavailableLogo();
+                    }
                 }
-                mStartCaptureWebcamStream.set(false);
             }
         });
     }
@@ -669,6 +1113,7 @@ public class CameraController {
             mCameraInfo = mCameraInfoMap.get(mCameraId);
             mUserPrefs.storeCameraId(mCameraId);
             mZoomRatio = mUserPrefs.fetchZoomRatio(mCameraId, /*defaultZoom*/ 1.0f);
+            mTapToFocusPoints = null;
         }
         mServiceEventsExecutor.execute(() -> {
             synchronized (mSerializationLock) {
@@ -682,10 +1127,14 @@ public class CameraController {
                         setupWebcamOnlyStreamAndOpenCameraLocked();
                         break;
                     case PREVIEW_STREAMING:
+                        // Preview size might change after toggling the camera.
+                        adjustPreviewOutputConfiguration();
                         setupPreviewOnlyStreamLocked(mPreviewSurface);
                         break;
                     case PREVIEW_AND_WEBCAM_STREAMING:
                         setupWebcamOnlyStreamAndOpenCameraLocked();
+                        // Preview size might change after toggling the camera.
+                        adjustPreviewOutputConfiguration();
                         setupPreviewStreamAlongsideWebcamStreamLocked(mPreviewSurface);
                         break;
                 }
@@ -705,6 +1154,218 @@ public class CameraController {
      */
     public int getCurrentRotation() {
         return mRotationProvider.getRotation();
+    }
+
+    /**
+     * Returns the best suitable output size for preview.
+     *
+     * <p>If the webcam stream doesn't exist, find the largest 16:9 supported output size which is
+     * not larger than 1080p. If the webcam stream exists, find the largest supported output size
+     * which matches the aspect ratio of the webcam stream size and is not larger than the
+     * display size or 1080p, whichever is smaller.
+     */
+    public Size getSuitablePreviewSize() {
+        if (mCameraId == null) {
+            Log.e(TAG, "No camera is found on the device.");
+            return null;
+        }
+        Size s1080p = new Size(1920, 1080);
+        // PREVIEW is max(1080p, display size) - this is the max size of preview streams that is
+        // guaranteed to be supported, when another YUV stream (here the webcam stream) is also
+        // configured.
+        Size maxPreviewSize =
+                (1920 * 1080)  >
+                        (mDisplaySize.getWidth() * mDisplaySize.getHeight()) ?
+                                mDisplaySize : s1080p;
+
+        // If webcam stream exists, find an output size matching its aspect ratio. Otherwise, find
+        // an output size with 16:9 aspect ratio.
+        final Rational targetAspectRatio = new Rational(maxPreviewSize.getWidth(),
+                maxPreviewSize.getHeight());
+
+        StreamConfigurationMap map = getCameraCharacteristic(mCameraId,
+                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+
+        if (map == null) {
+            Log.e(TAG, "Failed to retrieve StreamConfigurationMap. Return null preview size.");
+            return null;
+        }
+
+        Size[] outputSizes = map.getOutputSizes(SurfaceTexture.class);
+
+        if (outputSizes == null || outputSizes.length == 0) {
+            Log.e(TAG, "Empty output sizes. Return null preview size.");
+            return null;
+        }
+
+        Size previewSize = Arrays.stream(outputSizes)
+                .filter(size -> targetAspectRatio.equals(
+                        new Rational(size.getWidth(), size.getHeight())))
+                .filter(size -> size.getWidth() * size.getHeight()
+                        <= maxPreviewSize.getWidth() * maxPreviewSize.getHeight())
+                .max(Comparator.comparingInt(s -> s.getWidth() * s.getHeight()))
+                .orElse(null);
+
+        Log.d(TAG, "Suitable preview size is " + previewSize);
+        return previewSize;
+    }
+
+    /**
+     * Trigger tap-to-focus operation for the specified normalized points mapping to the FOV.
+     *
+     * <p>The specified normalized points will be used to calculate the corresponding metering
+     * rectangles that will be applied for AF, AE and AWB.
+     */
+    public void tapToFocus(float[] normalizedPoint) {
+        mServiceEventsExecutor.execute(() -> {
+            synchronized (mSerializationLock) {
+                if (mCameraDevice == null || mCaptureSession == null) {
+                    return;
+                }
+
+                try {
+                    mTapToFocusPoints = normalizedPoint;
+                    MeteringRectangle[] meteringRectangles =
+                            new MeteringRectangle[]{calculateMeteringRectangle(normalizedPoint)};
+                    // Updates the metering rectangles to the repeating request
+                    updateTapToFocusParameters(mPreviewRequestBuilder, meteringRectangles,
+                            /* afTriggerStart */ false);
+                    mCaptureSession.setSingleRepeatingRequest(mPreviewRequestBuilder.build(),
+                            mCameraCallbacksExecutor, mCaptureCallback);
+
+                    // Creates a capture request to trigger AF start for the metering rectangles.
+                    CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(
+                            CameraDevice.TEMPLATE_PREVIEW);
+                    CaptureRequest previewCaptureRequest = mPreviewRequestBuilder.build();
+
+                    for (CaptureRequest.Key<?> key : previewCaptureRequest.getKeys()) {
+                        builder.set((CaptureRequest.Key) key, previewCaptureRequest.get(key));
+                    }
+
+                    if (mImgReader != null && previewCaptureRequest.containsTarget(
+                            mImgReader.getSurface())) {
+                        builder.addTarget(mImgReader.getSurface());
+                    }
+
+                    if (mPreviewSurface != null && previewCaptureRequest.containsTarget(
+                            mPreviewSurface)) {
+                        builder.addTarget(mPreviewSurface);
+                    }
+
+                    updateTapToFocusParameters(builder, meteringRectangles,
+                            /* afTriggerStart */ true);
+
+                    mCaptureSession.captureSingleRequest(builder.build(),
+                            mCameraCallbacksExecutor, mCaptureCallback);
+                } catch (CameraAccessException e) {
+                    Log.e(TAG, "Failed to execute tap-to-focus to the working camera.", e);
+                }
+            }
+        });
+    }
+
+    /**
+     * Resets to the auto-focus mode.
+     */
+    public void resetToAutoFocus() {
+        mServiceEventsExecutor.execute(() -> {
+            synchronized (mSerializationLock) {
+                if (mCameraDevice == null || mCaptureSession == null) {
+                    return;
+                }
+                mTapToFocusPoints = null;
+
+                // Resets to CONTINUOUS_VIDEO mode
+                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+                // Clears the Af/Ae/Awb regions
+                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AF_REGIONS, null);
+                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_REGIONS, null);
+                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_REGIONS, null);
+
+                try {
+                    mCaptureSession.setSingleRepeatingRequest(mPreviewRequestBuilder.build(),
+                            mCameraCallbacksExecutor, mCaptureCallback);
+                } catch (CameraAccessException e) {
+                    Log.e(TAG, "Failed to reset to auto-focus mode to the working camera.", e);
+                }
+            }
+        });
+    }
+
+    /**
+     * Retrieves current tap-to-focus points.
+     *
+     * @return the normalized points or {@code null} if it is auto-focus mode currently.
+     */
+    public float[] getTapToFocusPoints() {
+        synchronized (mSerializationLock) {
+            return mTapToFocusPoints == null ? null
+                    : new float[]{mTapToFocusPoints[0], mTapToFocusPoints[1]};
+        }
+    }
+
+    /**
+     * Calculates the metering rectangle according to the normalized point.
+     */
+    private MeteringRectangle calculateMeteringRectangle(float[] normalizedPoint) {
+        CameraInfo cameraInfo = getCameraInfo();
+        Rect activeArraySize = cameraInfo.getActiveArraySize();
+        float halfMeteringRectWidth = (METERING_RECTANGLE_SIZE_RATIO * activeArraySize.width()) / 2;
+        float halfMeteringRectHeight =
+                (METERING_RECTANGLE_SIZE_RATIO * activeArraySize.height()) / 2;
+
+        Matrix matrix = new Matrix();
+        matrix.postRotate(-cameraInfo.getSensorOrientation(), 0.5f, 0.5f);
+        // Flips if current working camera is front camera
+        if (cameraInfo.getLensFacing() == CameraCharacteristics.LENS_FACING_FRONT) {
+            matrix.postScale(1, -1, 0.5f, 0.5f);
+        }
+        matrix.postScale(activeArraySize.width(), activeArraySize.height());
+        float[] mappingPoints = new float[]{normalizedPoint[0], normalizedPoint[1]};
+        matrix.mapPoints(mappingPoints);
+
+        Rect meteringRegion = new Rect(
+                clamp((int) (mappingPoints[0] - halfMeteringRectWidth), 0,
+                        activeArraySize.width()),
+                clamp((int) (mappingPoints[1] - halfMeteringRectHeight), 0,
+                        activeArraySize.height()),
+                clamp((int) (mappingPoints[0] + halfMeteringRectWidth), 0,
+                        activeArraySize.width()),
+                clamp((int) (mappingPoints[1] + halfMeteringRectHeight), 0,
+                        activeArraySize.height())
+        );
+
+        return new MeteringRectangle(meteringRegion, MeteringRectangle.METERING_WEIGHT_MAX);
+    }
+
+    private int clamp(int value, int min, int max) {
+        return Math.min(Math.max(value, min), max);
+    }
+
+    /**
+     * Updates tap-to-focus parameters to the capture request builder.
+     *
+     * @param builder            the capture request builder to apply the parameters
+     * @param meteringRectangles the metering rectangles to apply to the capture request builder
+     * @param afTriggerStart     sets CONTROL_AF_TRIGGER as CONTROL_AF_TRIGGER_START if this
+     *                           parameter is {@code true}. Otherwise, sets nothing to
+     *                           CONTROL_AF_TRIGGER.
+     */
+    private void updateTapToFocusParameters(CaptureRequest.Builder builder,
+            MeteringRectangle[] meteringRectangles, boolean afTriggerStart) {
+        builder.set(CaptureRequest.CONTROL_AF_REGIONS, meteringRectangles);
+        builder.set(CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_AUTO);
+        builder.set(CaptureRequest.CONTROL_AE_REGIONS, meteringRectangles);
+        builder.set(CaptureRequest.CONTROL_AE_MODE,
+                CaptureRequest.CONTROL_AE_MODE_ON);
+        builder.set(CaptureRequest.CONTROL_AWB_REGIONS, meteringRectangles);
+
+        if (afTriggerStart) {
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                    CaptureRequest.CONTROL_AF_TRIGGER_START);
+        }
     }
 
     private static class ImageAndBuffer {
